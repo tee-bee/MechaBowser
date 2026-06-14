@@ -20,6 +20,8 @@ mclient = pymongo.MongoClient(config.mongoURI)
 class MainEvents(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.serverLogQueue = []
+        self.serverLogLastSend = time.time()
 
     async def cog_load(self):
         logging.info('[Core] Waiting for guild caches to chunk...')
@@ -40,6 +42,7 @@ class MainEvents(commands.Cog):
             pass
 
         # self.sanitize_eud.start()  # pylint: disable=no-member
+        self.run_process_logs.start()
 
         self.serverLogs = self.bot.get_channel(config.logChannel)
         self.modLogs = self.bot.get_channel(config.modChannel)
@@ -61,8 +64,10 @@ class MainEvents(commands.Cog):
                 }
             )
 
-    #    def cog_unload(self):
-    #        self.sanitize_eud.cancel()  # pylint: disable=no-member
+    async def cog_unload(self):
+        self.run_process_logs.cancel()
+
+    # self.sanitize_eud.cancel()  # pylint: disable=no-member
 
     @tasks.loop(hours=24)
     async def sanitize_eud(self):
@@ -77,6 +82,60 @@ class MainEvents(commands.Cog):
         )
 
         logging.info('[Core] Finished sanitzation of old EUD')
+
+    @tasks.loop(seconds=2.0)
+    async def run_process_logs(self):
+        await self.process_logs()
+
+    @run_process_logs.after_loop
+    async def on_process_logs_cancel(self):
+        if self.run_process_logs.is_being_cancelled() and len(self.serverLogQueue) != 0:
+            while self.serverLogQueue:
+                await self.process_logs(force_run=True)
+
+    async def process_logs(self, force_run=False):
+        if not force_run and len(self.serverLogQueue) < 10 and time.time() - self.serverLogLastSend < 10:
+            # Execution is not forced and it has been less than 10 seconds since last ran with <10 in queue, delay
+            return
+
+        if not self.serverLogQueue:
+            # Queue is empty
+            return
+
+        messageIndex = 0
+        characterCount = 0
+        pendingMessages = []
+        for log in self.serverLogQueue:
+            messageIndex += 1
+
+            # We must count every Embed attribute's character count to ensure we won't exceed the limit.
+            characterCount += (
+                len(log.author.name or '')
+                + len(log.description or '')
+                + sum(len(field.name) + len(field.value) for field in log.fields)
+                + len(log.footer.text or '')
+                + len(log.title or '')
+            )
+            if characterCount < 6000 and messageIndex <= 10:
+                pendingMessages.append(log)
+                self.serverLogQueue.remove(log)
+                continue
+
+            else:
+                # We are either over the character limit, >10 embeds, or both
+                break
+
+        try:
+            await self.serverLogs.send(embeds=pendingMessages)
+
+        except Exception as e:
+            logging.error(f'[Core] Error while processing server logs: {e}. Will retry')
+            self.serverLogQueue.extend(pendingMessages)
+            await asyncio.sleep(5.0)
+            return
+
+        else:
+            self.serverLogLastSend = time.time()
 
     @app_commands.command(
         name='ping', description='Checks that the bot is responding normally and shows various latency values'
@@ -514,6 +573,9 @@ class MainEvents(commands.Cog):
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload):
         db = mclient.bowser.messages
+        dbMessage = db.find_one_and_update(
+            {'_id': payload.message_id, 'channel': payload.channel_id}, {'$set': {'deleted': True}}
+        )
         if payload.cached_message:
             if (
                 payload.cached_message.type not in [discord.MessageType.default, discord.MessageType.reply]
@@ -528,36 +590,54 @@ class MainEvents(commands.Cog):
             if not payload.cached_message.content and not payload.cached_message.attachments:
                 return  # Blank or null content (could be embed)
 
-            db.update_one({'_id': payload.message_id, 'channel': payload.channel_id}, {'$set': {'deleted': True}})
-
-            user = payload.cached_message.author
+            cachedUser = payload.cached_message.author
+            user = {
+                'author_field': f'{str(cachedUser)} ({cachedUser.id})',
+                'author_id': cachedUser.id,
+                'author_icon': cachedUser.display_avatar.url,
+            }
             jump_url = payload.cached_message.jump_url
             content = payload.cached_message.content if payload.cached_message.content else '-No message content-'
+            msgTimestamp = payload.cached_message.created_at
 
         else:
             # Message is not in ram cache, pull from DB or ignore if missing
-            dbMessage = db.find_one_and_update(
-                {'_id': payload.message_id, 'channel': payload.channel_id}, {'$set': {'deleted': True}}
-            )
             if not dbMessage:
                 logging.warning(
                     f'[Core] Missing message metadata for deletion of {payload.channel_id}/{payload.message_id}'
                 )
                 return
 
-            user = await self.bot.fetch_user(dbMessage['author'])
+            dbUser = db.find_one({'_id': dbMessage['author']})
+            if not dbUser or not dbUser['nameHist']:
+                # The user either isn't in the database (unlikely) or we have no prior names recorded
+                user = {'author_field': f'{dbMessage['author']}', 'author_id': dbMessage['author'], 'author_icon': None}
+
+            else:
+                nameHist = [d for d in dbUser['nameHist'] if d.get('type') == 'name']
+                previousName = sorted(nameHist, key=lambda x: x['timestamp'])[0]['str']
+                user = {
+                    'author_field': f'{previousName} ({dbMessage["author"]})',
+                    'author_id': dbMessage["author"],
+                    'author_icon': None,
+                }
+
             jump_url = f'https://discord.com/channels/{dbMessage["guild"]}/{dbMessage["channel"]}/{dbMessage["_id"]}'
+            msgTimestamp = datetime.fromtimestamp(dbMessage['timestamp'], tz=timezone.utc)
             content = (
                 '-No saved copy of message content is available-' if not dbMessage['content'] else dbMessage['content']
             )
 
+        channel = self.bot.get_channel(payload.channel_id)
+        channel_name = payload.channel_id if not channel else channel.name
         embed = discord.Embed(
+            title=f'🗑️ Message deleted in ⁠#{channel_name}',
             description=f'[Jump to message]({jump_url})\n{content}',
             color=0xF8E71C,
-            timestamp=datetime.now(tz=timezone.utc),
+            timestamp=msgTimestamp,
         )
-        embed.set_author(name=f'{str(user)} ({user.id})', icon_url=user.display_avatar.url)
-        embed.add_field(name='Mention', value=f'<@{user.id}>')
+        embed.set_author(name=user['author_field'], icon_url=user['author_icon'])
+        embed.add_field(name='Mention', value=f'<@{user['author_id']}>')
         if payload.cached_message and len(payload.cached_message.attachments) == 1:
             embed.set_image(url=payload.cached_message.attachments[0].proxy_url)
 
@@ -571,7 +651,11 @@ class MainEvents(commands.Cog):
             embed.description = content
             embed.add_field(name='Jump', value=f'[Jump to message]({jump_url})')
 
-        await self.serverLogs.send(f':wastebasket: Message deleted in <#{payload.channel_id}>', embed=embed)
+        if user['author_icon'] == None:
+            embed.set_footer(text='Using cached name data, which may be out of date or inaccurate')
+
+        # Queue the message delete, helps with spam from Discord
+        self.serverLogQueue.append(embed)
 
     @commands.Cog.listener()
     async def on_message_edit(self, before, after):
